@@ -1,0 +1,15 @@
+#oic-debug-controls-root { position: fixed; right: 22px; bottom: 22px; z-index: 2147483647; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.oic-header-control, .oic-row-control { display: inline-flex; align-items: center; gap: 6px; padding: 7px; border-radius: 8px; background: #25221f; box-shadow: 0 4px 15px rgba(0,0,0,.25); color: white; }
+.oic-row-control { margin: 3px 0 0 8px; position: relative; z-index: 3; padding: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.18); vertical-align: middle; }
+.oic-page-control { display: inline-flex; align-items: center; gap: 7px; margin-right: 10px; vertical-align: middle; }
+.oic-debug-button { appearance: none; border: 1px solid transparent; border-radius: 5px; padding: 7px 10px; font: 600 12px/1.1 inherit; cursor: pointer; white-space: nowrap; }
+.oic-row-control .oic-debug-button { padding: 5px 7px; font-size: 11px; }
+.oic-edit { background: #d8efc7; color: #173b11; }
+.oic-activate-run { background: #d8efc7; color: #173b11; }
+.oic-debug-button:disabled { opacity: .55; cursor: wait; }
+.oic-status, .oic-hint { font-size: 12px; padding: 4px 7px; color: #fff; max-width: 250px; }
+.oic-page-status { color: #fff; background: #25221f; border-radius: 5px; font-size: 12px; padding: 7px 10px; white-space: nowrap; }
+.oic-hint { background: #fff7dd; color: #4b3b05; border-radius: 6px; box-shadow: 0 3px 10px rgba(0,0,0,.2); }
+.oic-toast { margin-top: 8px; max-width: 380px; padding: 10px; border-radius: 7px; box-shadow: 0 4px 16px rgba(0,0,0,.28); font-size: 13px; }
+.oic-toast-error { color: #71150c; background: #ffe8e5; }
+.oic-open-helper { margin-left: 8px; border: 0; border-radius: 4px; padding: 5px 7px; color: white; background: #85311f; cursor: pointer; }

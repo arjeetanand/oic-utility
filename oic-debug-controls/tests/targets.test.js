@@ -1,0 +1,17 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const context = {}; vm.createContext(context); vm.runInContext(fs.readFileSync(require("node:path").join(__dirname, "../shared/targets.js"), "utf8"), context);
+const T = context.OicTargets;
+const plain = value => JSON.parse(JSON.stringify(value));
+assert.deepEqual(plain(T.findFilteredTarget("Integration My Flow (MY_FLOW | 01.00.0000)")), { name: "My Flow", code: "MY_FLOW", version: "01.00.0000", key: "MY_FLOW|01.00.0000" });
+assert.deepEqual(plain(T.parseIntegrationText("My Flow (MY_FLOW | 1.0.0) Active")), { name: "My Flow", code: "MY_FLOW", version: "1.0.0", key: "MY_FLOW|1.0.0" });
+assert.deepEqual(plain(T.findFilteredTarget("Integration APINV_ATP_Create_Update_APInvoice_ERP_Arjeet (APIN_ATP_CREA_UPDA_APIN_ERP_ARJE | 01.00.0000)")), { name: "APINV_ATP_Create_Update_APInvoice_ERP_Arjeet", code: "APIN_ATP_CREA_UPDA_APIN_ERP_ARJE", version: "01.00.0000", key: "APIN_ATP_CREA_UPDA_APIN_ERP_ARJE|01.00.0000" });
+assert.equal(T.findFilteredTarget("Integration My Flow (display-only)"), null);
+assert.equal(T.parseIntegrationText("Some row with a truncated label"), null);
+assert.equal(T.isInstancesUrl("https://example/?root=monitoringTracking"), true);
+assert.equal(T.isInstancesUrl("https://example/?root=integration"), false);
+assert.deepEqual(plain(T.findPageTarget("Oracle Integration\narjeet_erp_test\n1.0.0 Configured\nSave")), { name: "arjeet_erp_test", code: "", version: "1.0.0", key: "arjeet_erp_test|1.0.0" });
+assert.deepEqual(plain(T.findPageTarget("Oracle Integration\narjeet_erp_test (1.0.0)\nRun\nConfigure and run")), { name: "arjeet_erp_test", code: "", version: "1.0.0", key: "arjeet_erp_test|1.0.0" });
+assert.equal(T.findPageTarget("Oracle Integration\nRun\nConfigure and run"), null);
+console.log("targets tests passed");
