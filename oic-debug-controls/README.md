@@ -1,8 +1,8 @@
 # OIC One-Click Debug Controls
 
-Local Manifest V3 extension for the Dev OIC design host. It adds one **Edit** control beside integration links in OIC Instances, **Save, Activate Debug & Run** in the integration editor, and **Edit** on the Run page. The extension uses the already signed-in browser session and a helper tab; it does not store Oracle credentials.
+Local Manifest V3 extension for the Dev OIC design host. It adds one **Edit** control beside integration links only on OIC Instances, **Save, Activate Debug & Run** in the integration editor, and **Edit** on the Run page. The extension uses the already signed-in browser session and a helper tab; it does not store Oracle credentials.
 
-The Run-page **Edit** control is isolated from OIC's native **Run** action, so selecting Edit never submits a run.
+The Run-page **Edit** control is isolated from OIC's native **Run** action, so selecting Edit never submits a run. Its arrow icon and tooltip indicate that the editor opens in a new browser tab.
 
 ## Install in Brave
 

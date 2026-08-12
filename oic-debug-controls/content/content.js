@@ -11,7 +11,10 @@
 
   function send(message) { return new Promise(function (resolve) { chrome.runtime.sendMessage(message, resolve); }); }
   function currentUrl() { return window.location.href; }
-  function isInstances() { return OicTargets.isInstancesUrl(currentUrl()) || /\bInstances\b/.test(document.body && document.body.innerText || ""); }
+  // A toast on the Integrations list says "go to Instances", so checking page text
+  // incorrectly mounted an Edit button beside every integration name. Route is the
+  // authoritative signal for this view.
+  function isInstances() { return OicTargets.isInstancesUrl(currentUrl()); }
   function isEditor() { return /root=integration(?:&|$)/i.test(currentUrl()) && !/root=integrations(?:&|$)/i.test(currentUrl()); }
   function isRun() { return /root=invokeIntegration(?:&|$)/i.test(currentUrl()); }
   function elementText(element) { return OicTargets.clean([element.getAttribute && element.getAttribute("aria-label"), element.getAttribute && element.getAttribute("title"), element.textContent].filter(Boolean).join(" ")); }
@@ -20,6 +23,7 @@
   function button(label, className, handler, disabled) {
     var btn = document.createElement("button");
     btn.type = "button"; btn.className = "oic-debug-button " + className; btn.textContent = label; btn.disabled = !!disabled;
+    if (className.indexOf("oic-edit") !== -1) btn.title = "Open this integration in a new tab";
     // OIC header controls can have delegated click handlers. Keep injected controls from
     // bubbling into a neighbouring native Run button or any parent toolbar command.
     btn.addEventListener("click", function (event) {
@@ -112,6 +116,9 @@
     var controlId = "oic-" + mode + "-control";
     var previous = document.getElementById(controlId);
     if (!anchor || !target) { if (previous) previous.remove(); return; }
+    // OIC's Run action host stacks arbitrary siblings vertically. Mark that host
+    // so the injected Edit control and native Run action share one horizontal row.
+    if (anchor.parentElement) anchor.parentElement.classList.add("oic-native-action-pair");
     var state = states.get(target.key);
     var busy = state && !state.complete && !state.error;
     if (previous && previous.dataset.targetKey === target.key && previous.dataset.busy === String(!!busy)) return;

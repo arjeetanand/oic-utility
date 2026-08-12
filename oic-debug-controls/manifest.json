@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OIC One-Click Debug Controls",
-  "version": "0.4.19",
+  "version": "0.4.22",
   "description": "Fast, guarded OIC edit, debug activation, and run controls.",
   "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": ["https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com/*"],

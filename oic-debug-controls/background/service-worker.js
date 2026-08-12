@@ -129,9 +129,11 @@ async function runUiProvider(operation, target, prefs, state) {
   }
   // Reuse the source tab after it leaves the editor. The editor owns OIC's lock, so
   // activating through a second tab would still see the exact integration as Locked.
+  // Every Edit request starts from a separate Design tab. Keeping an opener link makes
+  // the relationship clear in the browser while preserving the original OIC page.
   var helper = operation === "activate-debug-run" && /[?&]root=integrations(?:&|$)/i.test(source.url || "")
     ? source
-    : await chrome.tabs.create({ url: helperUrl.toString(), active: false });
+    : await chrome.tabs.create({ url: helperUrl.toString(), active: false, openerTabId: source.id });
   state.helperTabId = helper.id;
   if (helper.id !== source.id) await waitForTab(helper.id, 30000);
   state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? "Opening Integrations and activating debug…" : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
