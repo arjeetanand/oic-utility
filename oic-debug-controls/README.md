@@ -2,6 +2,8 @@
 
 Local Manifest V3 extension for the Dev OIC design host. It adds one **Edit** control beside integration links only on OIC Instances, **Save, Activate Debug & Run** in the integration editor, and **Edit** on the Run page. The extension uses the already signed-in browser session and a helper tab; it does not store Oracle credentials.
 
+Open the extension's settings to add one or more OIC Design environments (for example Dev and SIT). Enter the Design URL for each Oracle Cloud environment, save, and approve the browser permission prompt. Controls are applied to open OIC tabs immediately.
+
 The Run-page **Edit** control is isolated from OIC's native **Run** action, so selecting Edit never submits a run. Its arrow icon and tooltip indicate that the editor opens in a new browser tab.
 
 ## Install in Brave
@@ -12,7 +14,7 @@ The Run-page **Edit** control is isolated from OIC's native **Run** action, so s
 4. Choose this `oic-debug-controls` folder.
 5. Open the OIC **Instances** view. **Edit** appears immediately beside each integration link in the **Primary identifier** column.
 
-Selecting **Edit** finds the exact integration/version in Design. If it is Active, the extension deactivates it, waits for Configured status, and then opens that integration in the designer in a new tab. If it is already Configured, it opens the designer directly.
+Selecting **Edit** immediately switches to a new Design tab and finds the exact integration/version there. If it is Active, the extension deactivates it, waits for Configured status, and then opens that integration in the designer. If it is already Configured, it opens the designer directly.
 
 From the integration editor, **Save, Activate Debug & Run** saves pending changes (if any), leaves the editor to release OIC's edit lock, and activates the exact integration with the saved Debug activation settings. If OIC still reports that exact target as Locked, the confirmed flow unlocks it, reloads and verifies that the Locked state cleared, and only then activates. It turns the same tab into the OIC Run page. From the Run page, **Edit** uses the same guarded deactivate-then-open-editor flow as Instances.
 

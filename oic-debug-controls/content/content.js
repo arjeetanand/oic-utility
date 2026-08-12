@@ -1,6 +1,10 @@
 /* global chrome, OicTargets */
 (function () {
   "use strict";
+  // Dynamic host registration may also inject this file into an already open tab.
+  // Keep exactly one observer and one set of controls per OIC document.
+  if (window.__oicDebugControlsLoaded) return;
+  window.__oicDebugControlsLoaded = true;
   var ROOT_ID = "oic-debug-controls-root";
   var states = new Map();
   var observer;

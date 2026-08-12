@@ -1,12 +1,15 @@
 /* global importScripts, chrome, OicTargets */
 importScripts("../shared/targets.js");
 
-var DEFAULTS = { tracingLevel: "debug", allowRunAgain: true, payloadValidation: false };
+var DEFAULT_ORIGIN = "https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com";
+var CONTENT_SCRIPT_ID = "oic-debug-controls-configured-hosts";
+var DEFAULTS = { tracingLevel: "debug", allowRunAgain: true, payloadValidation: false, environments: [DEFAULT_ORIGIN] };
 var activeOperations = new Map();
 
 chrome.runtime.onInstalled.addListener(function () {
-  chrome.storage.local.get(DEFAULTS, function (stored) { chrome.storage.local.set(stored); });
+  chrome.storage.local.get(DEFAULTS, function (stored) { chrome.storage.local.set(stored, syncConfiguredContentScripts); });
 });
+chrome.runtime.onStartup.addListener(function () { syncConfiguredContentScripts(); });
 
 chrome.action.onClicked.addListener(function () { chrome.runtime.openOptionsPage(); });
 
@@ -24,7 +27,40 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   if (message.type === "oic:open-helper") {
     if (Number.isInteger(message.tabId)) chrome.tabs.update(message.tabId, { active: true });
   }
+  if (message.type === "oic:sync-hosts") {
+    syncConfiguredContentScripts().then(function () { sendResponse({ ok: true }); }).catch(function (error) { sendResponse({ ok: false, error: error.message || String(error) }); });
+    return true;
+  }
 });
+
+function originPattern(url) { return new URL(url).origin + "/*"; }
+
+function configuredOrigins() {
+  return storageGet(DEFAULTS).then(function (settings) {
+    return Array.from(new Set((settings.environments || [DEFAULT_ORIGIN]).map(function (value) {
+      try { var url = new URL(value); return url.protocol === "https:" ? url.origin : null; } catch (_error) { return null; }
+    }).filter(Boolean)));
+  });
+}
+
+async function syncConfiguredContentScripts() {
+  var origins = await configuredOrigins();
+  var matches = origins.map(function (origin) { return origin + "/*"; });
+  try { await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] }); } catch (_error) {}
+  if (matches.length) await chrome.scripting.registerContentScripts([{ id: CONTENT_SCRIPT_ID, matches: matches, js: ["shared/targets.js", "content/content.js"], css: ["content/content.css"], runAt: "document_idle" }]);
+  // Registered content scripts run on the next navigation. Inject once into any
+  // matching tabs already open, so adding Dev/SIT takes effect immediately.
+  var tabs = await new Promise(function (resolve) { chrome.tabs.query({ url: matches }, resolve); });
+  await Promise.all(tabs.map(async function (tab) {
+    try {
+      await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["content/content.css"] });
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["shared/targets.js", "content/content.js"], world: "ISOLATED" });
+    } catch (_error) {
+      // Ignore a tab that is navigating or has already closed; the registered
+      // content script will load on its next completed navigation.
+    }
+  }));
+}
 
 function serializeError(error) {
   return { message: error && error.message ? error.message : String(error), helperTabId: error && error.helperTabId };
@@ -57,7 +93,7 @@ async function startOperation(operation, target, sourceTabId) {
     state.phase = "Complete";
     state.complete = true;
     publishState(target.key);
-    setTimeout(function () { activeOperations.delete(target.key); publishState(target.key); }, 3000);
+    setTimeout(function () { activeOperations.delete(target.key); publishState(target.key, sourceTabId); }, 3000);
     return result;
   } catch (error) {
     state.error = error.message || String(error);
@@ -66,7 +102,7 @@ async function startOperation(operation, target, sourceTabId) {
     // An explicit new user click may retry after a safe, pre-submission failure. Keep the
     // helper tab available for review, but never leave a stale in-progress lock behind.
     activeOperations.delete(target.key);
-    publishState(target.key);
+    publishState(target.key, sourceTabId);
     throw error;
   }
 }
@@ -79,9 +115,15 @@ function validateRequest(operation, target, sourceTabId) {
   if (!Number.isInteger(sourceTabId)) throw new Error("This action must be started from an OIC tab.");
 }
 
-function publishState(key) {
-  chrome.tabs.query({ url: "https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com/*" }, function (tabs) {
-    tabs.forEach(function (tab) { chrome.tabs.sendMessage(tab.id, { type: "oic:state", key: key, state: activeOperations.get(key) || null }).catch(function () {}); });
+function publishState(key, sourceTabId) {
+  var operation = activeOperations.get(key);
+  var tabId = operation && operation.sourceTabId || sourceTabId;
+  if (!Number.isInteger(tabId)) return;
+  chrome.tabs.get(tabId, function (source) {
+    if (chrome.runtime.lastError || !source || !source.url) return;
+    chrome.tabs.query({ url: originPattern(source.url) }, function (tabs) {
+      tabs.forEach(function (tab) { chrome.tabs.sendMessage(tab.id, { type: "oic:state", key: key, state: activeOperations.get(key) || null }).catch(function () {}); });
+    });
   });
 }
 
@@ -112,9 +154,7 @@ async function runUiProvider(operation, target, prefs, state) {
   if (!instance) throw new Error("Could not determine the OIC service instance from this page.");
   // Start on the Integrations list directly. Cloning the Instances URL and clicking the
   // Design navigation is unreliable when OIC's left navigation is collapsed.
-  var hostTabs = await new Promise(function (resolve) {
-    chrome.tabs.query({ url: "https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com/*" }, resolve);
-  });
+  var hostTabs = await new Promise(function (resolve) { chrome.tabs.query({ url: originPattern(source.url) }, resolve); });
   var existingList = hostTabs.find(function (tab) { return /[?&]root=integrations(?:&|$)/i.test(tab.url || ""); });
   var helperUrl;
   if (existingList) {
@@ -133,7 +173,9 @@ async function runUiProvider(operation, target, prefs, state) {
   // the relationship clear in the browser while preserving the original OIC page.
   var helper = operation === "activate-debug-run" && /[?&]root=integrations(?:&|$)/i.test(source.url || "")
     ? source
-    : await chrome.tabs.create({ url: helperUrl.toString(), active: false, openerTabId: source.id });
+    // Edit is a user-requested navigation: foreground the new Design tab right away
+    // so the user does not have to locate and select it while OIC is loading.
+    : await chrome.tabs.create({ url: helperUrl.toString(), active: operation === "edit", openerTabId: source.id });
   state.helperTabId = helper.id;
   if (helper.id !== source.id) await waitForTab(helper.id, 30000);
   state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? "Opening Integrations and activating debug…" : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
