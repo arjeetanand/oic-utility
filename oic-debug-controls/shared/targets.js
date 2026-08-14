@@ -13,6 +13,29 @@
     return { name: clean(name) || code, code: code, version: version, key: code + "|" + version };
   }
 
+  function makeListTarget(rowId, name, version, status) {
+    var identity = clean(rowId).match(/^(.+?)\s*\|\s*(\d+(?:\.\d+){1,3})$/);
+    if (!identity) return null;
+    var target = makeTarget(name, identity[1], identity[2] || version);
+    if (!target) return null;
+    target.status = clean(status);
+    return target;
+  }
+
+  function isActiveStatus(status) {
+    return /^active(?:\s|$)/i.test(clean(status));
+  }
+
+  function isDebugStatus(status) {
+    return /\bdebug\s+tracing\b/i.test(clean(status));
+  }
+
+  function findIntegrationCount(text) {
+    var matches = Array.from(String(text || "").matchAll(/(?:^|\s)(\d[\d,]*)\s+integrations?\b/gi));
+    if (!matches.length) return null;
+    return Number(matches[matches.length - 1][1].replace(/,/g, ""));
+  }
+
   function parseIntegrationText(text) {
     var normalized = clean(text);
     var filter = normalized.match(FILTER_PATTERN);
@@ -54,13 +77,25 @@
     return /(?:root=monitoringTracking|monitoringTracking|\/instances)/i.test(String(url || ""));
   }
 
+  // OIC has used both routes for the Configure and run page. `submitIntegration`
+  // is the current route in newer Design tenants, while `invokeIntegration`
+  // remains in older tenants.
+  function isRunUrl(url) {
+    return /root=(?:invokeIntegration|submitIntegration)(?:&|$)/i.test(String(url || ""));
+  }
+
   root.OicTargets = {
     clean: clean,
     makeTarget: makeTarget,
+    makeListTarget: makeListTarget,
+    isActiveStatus: isActiveStatus,
+    isDebugStatus: isDebugStatus,
+    findIntegrationCount: findIntegrationCount,
     parseIntegrationText: parseIntegrationText,
     findFilteredTarget: findFilteredTarget,
     findPageTarget: findPageTarget,
     targetFromElement: targetFromElement,
-    isInstancesUrl: isInstancesUrl
+    isInstancesUrl: isInstancesUrl,
+    isRunUrl: isRunUrl
   };
 })(typeof self !== "undefined" ? self : this);

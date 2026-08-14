@@ -10,6 +10,7 @@ It uses the browser's existing signed-in OIC session and does not store Oracle c
 
 | OIC page | Added control | What it does |
 | --- | --- | --- |
+| **Integrations** | **Apply Debug Settings to N Active** | Applies Debug tracing and the saved rerun and payload-validation settings to every currently Active integration in the current filtered results, or all results when no filter is applied. |
 | **Instances** | **Edit** | Opens the selected integration/version in a new Design tab. If it is Active, it deactivates it before opening the editor. |
 | **Integration editor** | **Save, Activate Debug & Run** | Saves pending work, releases the editor lock, activates the exact integration with Debug settings, and opens its Run page. |
 | **Run page** | **Edit** | Opens the current integration/version in the editor using the same guarded deactivate flow. |
@@ -31,9 +32,19 @@ To use the repository's ZIP package, extract `oic-debug-controls.zip` first, the
 
 Only HTTPS `*.oraclecloud.com` URLs are accepted. The extension requests access only for saved origins; controls are injected into already open matching OIC tabs immediately.
 
-Settings also let you choose the activation tracing level and whether to allow reruns or payload validation.
+Debug tracing is always used. Settings let you choose whether to allow reruns or enable payload validation during activation.
 
 ## Workflow
+
+### Bulk Debug activation
+
+1. Open **Integrations** and optionally apply filters.
+2. Select **Apply Debug Settings to _N_ Active**.
+3. Review and confirm the exact scope. The extension processes each integration sequentially and reports updated, skipped, and failed counts.
+
+The bulk action re-checks status immediately before each change and skips integrations that are no longer Active. It reapplies Debug and the saved **Allow to run again** and **Enable payload validation** selections, including for integrations already in Debug.
+
+### Edit, activate, and run
 
 1. In OIC **Instances**, select **Edit** beside an integration link in the **Primary identifier** column.
 2. Confirm the prompt. If the integration is Active, the extension waits for OIC to deactivate it and then opens the editor.

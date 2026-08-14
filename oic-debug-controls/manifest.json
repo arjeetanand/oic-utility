@@ -1,12 +1,20 @@
 {
   "manifest_version": 3,
   "name": "OIC One-Click Debug Controls",
-  "version": "0.5.1",
-  "description": "Fast, guarded OIC edit, debug activation, and run controls.",
+  "version": "0.8.1",
+  "description": "Fast, guarded OIC edit, bulk Debug activation, and run controls.",
   "permissions": ["storage", "tabs", "scripting"],
   "host_permissions": ["https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com/*"],
   "optional_host_permissions": ["https://*.oraclecloud.com/*"],
   "background": { "service_worker": "background/service-worker.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://design.integration.ap-hyderabad-1.ocp.oraclecloud.com/*"],
+      "js": ["shared/targets.js", "content/content.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    }
+  ],
   "options_page": "options/options.html",
   "action": { "default_title": "OIC Debug Controls settings" }
 }

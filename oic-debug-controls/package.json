@@ -1,5 +1,5 @@
 {
   "name": "oic-debug-controls",
   "private": true,
-  "scripts": { "test": "node tests/targets.test.js", "check": "node --check background/service-worker.js && node --check content/content.js && node --check options/options.js && node --check shared/targets.js" }
+  "scripts": { "test": "node tests/targets.test.js && node tests/bulk-orchestration.test.js", "check": "node --check background/service-worker.js && node --check content/content.js && node --check options/options.js && node --check shared/targets.js" }
 }

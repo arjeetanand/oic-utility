@@ -24,6 +24,25 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
       .catch(function (error) { sendResponse({ ok: false, error: serializeError(error) }); });
     return true;
   }
+  if (message.type === "oic:start-bulk") {
+    // A tab that was open while the extension updated can still have the previous
+    // content script. Fail immediately instead of re-entering the obsolete single
+    // long-running bulk event; refreshing the OIC tab loads the bounded v0.6.6 flow.
+    sendResponse({ ok: false, error: { message: "Refresh this OIC Integrations tab, then run Apply Debug Settings again." } });
+    return;
+  }
+  if (message.type === "oic:start-bulk-target") {
+    startBulkTarget(message.target, sender.tab && sender.tab.id, message.runtimeOptions)
+      .then(function (result) { sendResponse({ ok: true, result: result }); })
+      .catch(function (error) { sendResponse({ ok: false, error: serializeError(error) }); });
+    return true;
+  }
+  if (message.type === "oic:get-runtime-options") {
+    storageGet(DEFAULTS).then(function (settings) {
+      sendResponse({ ok: true, runtimeOptions: { allowRunAgain: !!settings.allowRunAgain, payloadValidation: !!settings.payloadValidation } });
+    }).catch(function (error) { sendResponse({ ok: false, error: serializeError(error) }); });
+    return true;
+  }
   if (message.type === "oic:open-helper") {
     if (Number.isInteger(message.tabId)) chrome.tabs.update(message.tabId, { active: true });
   }
@@ -45,12 +64,15 @@ function configuredOrigins() {
 
 async function syncConfiguredContentScripts() {
   var origins = await configuredOrigins();
-  var matches = origins.map(function (origin) { return origin + "/*"; });
+  // The default Hyderabad environment is injected statically by manifest.json so
+  // the control works even before this service worker wakes. Register only extra
+  // user-configured environments dynamically.
+  var matches = origins.filter(function (origin) { return origin !== DEFAULT_ORIGIN; }).map(function (origin) { return origin + "/*"; });
   try { await chrome.scripting.unregisterContentScripts({ ids: [CONTENT_SCRIPT_ID] }); } catch (_error) {}
   if (matches.length) await chrome.scripting.registerContentScripts([{ id: CONTENT_SCRIPT_ID, matches: matches, js: ["shared/targets.js", "content/content.js"], css: ["content/content.css"], runAt: "document_idle" }]);
   // Registered content scripts run on the next navigation. Inject once into any
   // matching tabs already open, so adding Dev/SIT takes effect immediately.
-  var tabs = await new Promise(function (resolve) { chrome.tabs.query({ url: matches }, resolve); });
+  var tabs = matches.length ? await new Promise(function (resolve) { chrome.tabs.query({ url: matches }, resolve); }) : [];
   await Promise.all(tabs.map(async function (tab) {
     try {
       await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["content/content.css"] });
@@ -64,6 +86,38 @@ async function syncConfiguredContentScripts() {
 
 function serializeError(error) {
   return { message: error && error.message ? error.message : String(error), helperTabId: error && error.helperTabId };
+}
+
+// Run one bulk target per runtime message. A full batch can legitimately take more
+// than Chrome's service-worker event lifetime because OIC may spend up to 90 seconds
+// verifying each integration. Keeping every row inside one message caused larger
+// batches to be terminated mid-run with no final result. The content script now
+// sequences these bounded target operations and owns the aggregate summary.
+async function startBulkTarget(target, sourceTabId, requestedRuntimeOptions) {
+  if (!Number.isInteger(sourceTabId)) throw new Error("This action must be started from an OIC Integrations tab.");
+  var source = await chrome.tabs.get(sourceTabId);
+  if (!source || !/[?&]root=integrations(?:&|$)/i.test(source.url || "")) throw new Error("Activate Active in Debug must be started from the OIC Integrations list.");
+  validateRequest("activate-debug", target, sourceTabId);
+  if (activeOperations.has(target.key)) return { status: "skipped-busy", target: target };
+
+  var stored = await storageGet(DEFAULTS);
+  var runtimeOptions = requestedRuntimeOptions && typeof requestedRuntimeOptions === "object" ? requestedRuntimeOptions : stored;
+  var prefs = Object.assign({}, stored, {
+    allowRunAgain: !!runtimeOptions.allowRunAgain,
+    payloadValidation: !!runtimeOptions.payloadValidation,
+    tracingLevel: "debug",
+    preserveActivationOptions: false,
+    requireActive: true
+  });
+  var operationState = { phase: "Applying Debug settings to " + target.name, operation: "activate-debug", target: target, sourceTabId: sourceTabId, helperTabId: null };
+  activeOperations.set(target.key, operationState);
+  publishState(target.key, sourceTabId);
+  try {
+    return await runUiProvider("activate-debug", target, prefs, operationState);
+  } finally {
+    activeOperations.delete(target.key);
+    publishState(target.key, sourceTabId);
+  }
 }
 
 async function startOperation(operation, target, sourceTabId) {
@@ -177,29 +231,34 @@ async function runUiProvider(operation, target, prefs, state) {
     // so the user does not have to locate and select it while OIC is loading.
     : await chrome.tabs.create({ url: helperUrl.toString(), active: operation === "edit", openerTabId: source.id });
   state.helperTabId = helper.id;
-  if (helper.id !== source.id) await waitForTab(helper.id, 30000);
-  state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? "Opening Integrations and activating debug…" : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
-  publishState(target.key);
-  var submitted = await execute(helper.id, executeUiFlow, [operation, target, prefs]);
-  if (!submitted || !submitted.ok) throw withHelper(new Error((submitted && submitted.error) || "OIC did not accept the operation. Review the helper tab."), helper.id);
-  if (submitted.unlocked) {
-    state.phase = "Waiting for OIC to unlock…";
+  // Bulk Debug always uses a disposable helper tab. Close it in finally, even
+  // when OIC rejects a change, so only the original Integrations tab remains.
+  var closeHelperWhenFinished = operation === "activate-debug" && helper.id !== source.id;
+  try {
+    if (helper.id !== source.id) await waitForTab(helper.id, 30000);
+    state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? "Opening Integrations and activating debug…" : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
     publishState(target.key);
-    var unlocked = await verifyUnlockedWithReloads(helper.id, target, 60000);
-    if (!unlocked.ok) throw withHelper(new Error(unlocked.error || "OIC did not clear the Locked state. Review the helper tab."), helper.id);
-    state.phase = "Activating Debug…";
-    publishState(target.key);
-    submitted = await execute(helper.id, executeUiFlow, [operation, target, prefs]);
-    if (!submitted || !submitted.ok || !submitted.submitted) throw withHelper(new Error((submitted && submitted.error) || "OIC did not accept Debug activation after unlocking."), helper.id);
-  }
-  var verified = { ok: true, status: submitted.status || "configured" };
-  if (submitted.submitted) {
+    var submitted = await execute(helper.id, executeUiFlow, [operation, target, prefs]);
+    if (!submitted || !submitted.ok) throw withHelper(new Error((submitted && submitted.error) || "OIC did not accept the operation."), helper.id);
+    var verified = { ok: true, status: submitted.status || "configured" };
+    if (submitted.submitted) {
     state.phase = "Waiting for OIC to finish…";
     publishState(target.key);
     verified = await verifyWithReloads(helper.id, operation === "edit" ? "deactivate" : operation === "activate-debug-run" ? "activate-debug" : operation, target, 90000);
     if (!verified.ok) throw withHelper(new Error(verified.error || "OIC did not reach the expected status. Review the helper tab."), helper.id);
-  }
-  if (operation === "edit") {
+    }
+    if (operation === "activate-debug" || operation === "activate-debug-run") {
+    state.phase = "Verifying Debug runtime options…";
+    publishState(target.key);
+    var runtimeVerified = await verifyActivationRuntimeOptions(helper.id, target, prefs);
+    if (!runtimeVerified || !runtimeVerified.ok) {
+      // Configure activation is saved exactly once. If OIC acknowledges the
+      // save but does not persist a checkbox, report the observed mismatch;
+      // do not silently perform a second activation/save.
+      throw withHelper(new Error((runtimeVerified && runtimeVerified.error) || "OIC did not persist the required Debug runtime options."), helper.id);
+    }
+    }
+    if (operation === "edit") {
     state.phase = "Opening integration editor…";
     publishState(target.key);
     var opened = await execute(helper.id, openTargetEditor, [target]);
@@ -208,8 +267,8 @@ async function runUiProvider(operation, target, prefs, state) {
     if (!editor.ok) throw withHelper(new Error(editor.error || "The integration editor did not become editable."), helper.id);
     await chrome.tabs.update(helper.id, { active: true });
     return { status: "editor-open", target: target, helperTabId: helper.id };
-  }
-  if (operation === "activate-debug-run") {
+    }
+    if (operation === "activate-debug-run") {
     state.phase = "Opening Run…";
     publishState(target.key);
     // Oracle exposes Run from the exact integration row's Actions menu. Opening
@@ -218,9 +277,36 @@ async function runUiProvider(operation, target, prefs, state) {
     var runOpened = await openRunFromIntegrationsList(helper.id, target);
     if (!runOpened.ok) throw withHelper(new Error(runOpened.error || "OIC activated the integration but could not open its Run page."), helper.id);
     return { status: "run-open", target: target, skipSourceRefresh: true };
+    }
+    return { status: verified.status, target: target, verification: runtimeVerified && runtimeVerified.options };
+  } catch (error) {
+    // This tab is intentionally closed below, so never offer a dead helper-tab
+    // link in the bulk error toast.
+    if (closeHelperWhenFinished && error) error.helperTabId = null;
+    throw error;
+  } finally {
+    if (closeHelperWhenFinished) await closeHelperTab(helper.id);
   }
-  await chrome.tabs.remove(helper.id);
-  return { status: verified.status, target: target };
+}
+
+async function verifyActivationRuntimeOptions(tabId, target, prefs) {
+  var last;
+  // OIC can update its list badge before the activation-sheet model settles.
+  // Re-open and read the exact settings up to three times, without another Save.
+  for (var attempt = 0; attempt < 3; attempt += 1) {
+    last = await execute(tabId, inspectActivationRuntimeOptions, [target, prefs]);
+    if (last && last.ok) return last;
+    if (attempt < 2) await new Promise(function (resolve) { setTimeout(resolve, 1800); });
+  }
+  return last || { ok: false, error: "OIC did not expose runtime options for verification." };
+}
+
+async function closeHelperTab(tabId) {
+  try { await chrome.tabs.remove(tabId); }
+  catch (_error) {
+    // It may already be closed by the user or by OIC navigation. Either way the
+    // bulk operation must continue and leave the original source tab in place.
+  }
 }
 
 function withHelper(error, tabId) { error.helperTabId = tabId; return error; }
@@ -235,18 +321,6 @@ async function verifyWithReloads(tabId, operation, target, timeoutMs) {
     if (result && (result.ok || result.terminalError)) return result;
   }
   return { ok: false, error: "Timed out waiting for OIC to update " + target.code + "|" + target.version + "." };
-}
-
-async function verifyUnlockedWithReloads(tabId, target, timeoutMs) {
-  var deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await new Promise(function (resolve) { setTimeout(resolve, 1800); });
-    await new Promise(function (resolve) { chrome.tabs.reload(tabId, {}, resolve); });
-    await waitForTab(tabId, 30000);
-    var result = await execute(tabId, inspectUnlockedStatus, [target]);
-    if (result && result.ok) return result;
-  }
-  return { ok: false, error: "Timed out waiting for OIC to clear the Locked state for " + (target.code || target.name) + "." };
 }
 
 async function saveEditorIfNeeded(tabId, target) {
@@ -436,22 +510,94 @@ async function inspectTargetStatus(operation, target) {
   return { ok: false, status: "target-not-visible" };
 }
 
-async function inspectUnlockedStatus(target) {
+// The Integrations list exposes only the tracing badge. It cannot tell whether
+// OIC persisted Enable payload validation, so inspect the exact Configure
+// activation sheet after every bulk Debug operation before reporting success.
+async function inspectActivationRuntimeOptions(target, prefs) {
   function clean(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
-  function visible(element) { return !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length); }
+  function visible(element) {
+    if (!element) return false;
+    var style = getComputedStyle(element);
+    return !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length) && style.visibility !== "hidden" && style.display !== "none";
+  }
+  function labelOf(element) { return clean([element.getAttribute("aria-label"), element.getAttribute("title"), element.value, element.textContent].filter(Boolean).join(" ")); }
   function versionParts(value) {
     var parts = String(value || "").split(".").map(function (part) { return String(parseInt(part, 10) || 0); });
     while (parts.length > 1 && parts[parts.length - 1] === "0") parts.pop();
     return parts.join(".");
   }
-  var row = Array.from(document.querySelectorAll('tr,[role="row"],oj-list-item,li')).find(function (candidate) {
-    var text = clean(candidate.innerText || candidate.textContent);
-    return visible(candidate) && text.indexOf(target.name) !== -1 && text.split(/\s+/).some(function (word) { return versionParts(word.replace(/[^0-9.]/g, "")) === versionParts(target.version); });
-  });
-  if (!row) return { ok: false, error: "The exact integration is not visible after unlocking." };
-  return /\blocked\b/i.test(clean(row.innerText || row.textContent))
-    ? { ok: false, status: "locked" }
-    : { ok: true, status: "unlocked" };
+  function findRow() {
+    var expectedVersion = versionParts(target.version);
+    return Array.from(document.querySelectorAll("tr,[role=row],oj-list-item,li")).find(function (row) {
+      var text = clean(row.innerText || row.textContent);
+      var correctName = Array.from(row.querySelectorAll("a")).some(function (link) { return clean(labelOf(link)) === target.name; });
+      var correctVersion = text.split(/\s+/).some(function (word) { return versionParts(word.replace(/[^0-9.]/g, "")) === expectedVersion; });
+      return visible(row) && correctName && correctVersion && /\bactive\b/i.test(text);
+    });
+  }
+  function findSheet() {
+    var saves = Array.from(document.querySelectorAll("button")).filter(function (button) { return visible(button) && /^save$/i.test(labelOf(button)); });
+    for (var index = 0; index < saves.length; index += 1) {
+      var ancestor = saves[index].parentElement;
+      while (ancestor && ancestor !== document.body) {
+        var text = clean(ancestor.innerText || ancestor.textContent);
+        if (text.indexOf(target.name) !== -1 && /select tracing level|configure activation/i.test(text)) return ancestor;
+        ancestor = ancestor.parentElement;
+      }
+    }
+    return null;
+  }
+  function findCheckbox(sheet, text) {
+    var label = Array.from(sheet.querySelectorAll("label")).find(function (item) { return visible(item) && clean(item.textContent).toLowerCase().indexOf(text) !== -1; });
+    var inputId = label && label.getAttribute("for");
+    var input = inputId && document.getElementById(inputId);
+    if (input && sheet.contains(input)) return input;
+    throw new Error("OIC did not expose the " + text + " checkbox for verification.");
+  }
+  function checked(input) { return input.checked === true || input.getAttribute("aria-checked") === "true"; }
+  try {
+    if (!/root=integrations(?:&|$)/i.test(location.href)) throw new Error("OIC is not on the Integrations list while verifying runtime options.");
+    var row = findRow();
+    if (!row) throw new Error("Could not find the exact active integration while verifying runtime options.");
+    row.scrollIntoView({ block: "center" });
+    row.click();
+    await new Promise(function (resolve) { setTimeout(resolve, 350); });
+    var actionButton = Array.from(row.querySelectorAll("button")).find(function (button) { return /true/i.test(String(button.getAttribute("aria-haspopup") || "")); });
+    if (!actionButton) throw new Error("OIC did not expose the exact row Actions menu for runtime verification.");
+    actionButton.click();
+    var actionDeadline = Date.now() + 6000;
+    var configure;
+    while (Date.now() < actionDeadline && !configure) {
+      configure = Array.from(document.querySelectorAll("oj-option,[role=menuitem],button,a")).find(function (item) {
+        return visible(item) && /^configure activation$/i.test(labelOf(item));
+      });
+      if (!configure) await new Promise(function (resolve) { setTimeout(resolve, 200); });
+    }
+    if (!configure) throw new Error("OIC did not expose Configure activation for runtime verification.");
+    configure.click();
+    var sheetDeadline = Date.now() + 8000;
+    var sheet;
+    while (Date.now() < sheetDeadline && !(sheet = findSheet())) await new Promise(function (resolve) { setTimeout(resolve, 200); });
+    if (!sheet) throw new Error("OIC did not open Configure activation for runtime verification.");
+    var debugRadio = Array.from(sheet.querySelectorAll('input[type="radio"]')).find(function (input) {
+      var label = Array.from(sheet.querySelectorAll("label")).find(function (item) { return item.getAttribute("for") === input.id; });
+      return /debug/i.test(clean([input.value, label && label.textContent].filter(Boolean).join(" ")));
+    });
+    var allowRunAgain = findCheckbox(sheet, "allow to run again");
+    var payloadValidation = findCheckbox(sheet, "enable payload validation");
+    var options = { debug: !!(debugRadio && checked(debugRadio)), allowRunAgain: checked(allowRunAgain), payloadValidation: checked(payloadValidation) };
+    // Runtime settings are enable-only. An unchecked extension preference means
+    // "leave the current OIC value unchanged", never "turn it off".
+    var matches = options.debug
+      && (!prefs.allowRunAgain || options.allowRunAgain)
+      && (!prefs.payloadValidation || options.payloadValidation);
+    var cancel = Array.from(sheet.querySelectorAll("button")).find(function (button) { return visible(button) && /^cancel$/i.test(labelOf(button)); });
+    if (cancel) cancel.click();
+    if (!matches) {
+      return { ok: false, options: options, error: "OIC shows Debug=" + options.debug + ", Allow to run again=" + options.allowRunAgain + ", payload validation=" + options.payloadValidation + " after Save." };
+    }
+    return { ok: true, options: options };
+  } catch (error) { return { ok: false, error: error.message || String(error) }; }
 }
 
 async function refreshSource(tabId) {
@@ -585,24 +731,24 @@ async function executeUiFlow(operation, target, prefs) {
       var hasTracingChoice = scopedControls.some(function (item) {
         return /^(production|audit|debug)(\s|$)/i.test(labelOf(item));
       });
-      var hasActivate = scopedControls.some(function (item) {
-        return /^activate$/i.test(labelOf(item));
+      var hasSubmit = scopedControls.some(function (item) {
+        return /^(activate|save)$/i.test(labelOf(item));
       });
-      return hasTracingChoice && hasActivate;
+      return hasTracingChoice && hasSubmit;
     }
     var semantic = Array.from(document.querySelectorAll('[role="dialog"],oj-dialog')).find(matches);
     if (semantic) return semantic;
 
     // OIC 3 currently renders its right-side activation sheet as an ordinary
-    // container with no dialog role. Start at its exact Activate submit button
+    // container with no dialog role. Start at its exact Activate/Save submit button
     // and return the smallest visible ancestor that contains this integration's
     // title and tracing choices. This remains scoped to the already verified
     // target row and cannot match a different integration behind the sheet.
-    var activateButtons = controls().filter(function (item) {
-      return /^activate$/i.test(labelOf(item));
+    var submitButtons = controls().filter(function (item) {
+      return /^(activate|save)$/i.test(labelOf(item));
     });
-    for (var i = 0; i < activateButtons.length; i += 1) {
-      var ancestor = activateButtons[i].parentElement;
+    for (var i = 0; i < submitButtons.length; i += 1) {
+      var ancestor = submitButtons[i].parentElement;
       while (ancestor && ancestor !== document.body) {
         if (matches(ancestor)) return ancestor;
         ancestor = ancestor.parentElement;
@@ -611,10 +757,16 @@ async function executeUiFlow(operation, target, prefs) {
     return null;
   }
   function openActionMenu(element) {
-    // OIC's icon-only row overflow listens to the pointer lifecycle. Calling
-    // HTMLElement.click() alone selects the row but does not open the menu.
-    // Keep the event targeted at the already exact-matched action element.
+    // OIC wraps the real menu trigger in a zero-sized <oj-menu-button>. Pointer
+    // events sent to that wrapper never reach Oracle JET's internal native
+    // button, so the hidden menu stays closed. Target the internal button first;
+    // this is the same exact row-scoped Actions control already safety-checked.
     if (!element) return false;
+    var nativeButton = element.matches && element.matches("button") ? element : element.querySelector && element.querySelector("button");
+    if (nativeButton) {
+      nativeButton.click();
+      return true;
+    }
     var box = element.getBoundingClientRect();
     var eventOptions = { bubbles: true, cancelable: true, view: window, clientX: box.left + (box.width / 2), clientY: box.top + (box.height / 2), button: 0, buttons: 1 };
     try { element.dispatchEvent(new PointerEvent("pointerdown", eventOptions)); } catch (ignore) {}
@@ -685,45 +837,20 @@ async function executeUiFlow(operation, target, prefs) {
     }
     row.scrollIntoView({ block: "center" });
     // OIC only materializes a row's View / overflow / Open Details controls after
-    // selection. This must happen before Locked handling, otherwise Unlock cannot
-    // be found even though the exact target row was located successfully.
+    // selection. This must happen before checking Locked state so that the exact
+    // row's current status is available.
     row.click();
     ["mouseover", "mouseenter", "pointerover", "pointerenter"].forEach(function (type) {
       row.dispatchEvent(new MouseEvent(type, { bubbles: true, view: window }));
     });
     await sleep(700);
 
-    // A previously open editor can leave an integration Locked even after its tab has
-    // gone away. For an explicit Debug activation request, unlock only the already
-    // exact-matched row, confirm OIC names that exact integration/version, and wait for
-    // the Locked state to clear before exposing the activation action.
+    // Bulk Debug never unlocks integrations. Unlocking is a separate OIC action
+    // with potential data-loss implications, so a Locked row is left untouched.
+    // The caller reports it as skipped and the user can resolve the lock manually.
     var isActivation = operation === "activate-debug" || operation === "activate-debug-run";
     if (isActivation && /\blocked\b/i.test(normalize(row.innerText || row.textContent))) {
-      var unlockAction = findNamedIncludingHidden(["unlock"], row, true);
-      if (!unlockAction) {
-        var unlockMenu = rowActionMenu(row);
-        if (unlockMenu) { openActionMenu(unlockMenu); await sleep(300); }
-        unlockAction = await eventually(function () { return findNamed(["unlock"], document, true); }, 4000, "OIC did not expose Unlock in the exact row menu.");
-      }
-      if (!unlockAction) throw new Error("OIC reports " + identity + " as Locked, but its Unlock action is unavailable.");
-      unlockAction.click();
-      var unlockDialog = await eventually(function () { return Array.from(document.querySelectorAll('[role="dialog"],oj-dialog')).find(visible); }, 8000, "The Unlock confirmation did not open.");
-      var unlockText = normalize(unlockDialog.innerText || unlockDialog.textContent);
-      var unlockVersionMatches = unlockText.split(/\s+/).some(function (word) {
-        return versionParts(word.replace(/[^0-9.]/g, "")) === versionParts(target.version);
-      });
-      if (unlockText.indexOf(target.name) === -1 || !unlockVersionMatches || !/\bunlock\b/i.test(unlockText)) {
-        var unlockCancel = findNamed(["cancel"], unlockDialog);
-        if (unlockCancel) unlockCancel.click();
-        throw new Error("Safety check stopped unlocking because OIC's confirmation did not name " + target.name + " (" + target.version + ").");
-      }
-      var unlockConfirm = findNamed(["unlock"], unlockDialog);
-      if (!unlockConfirm) throw new Error("The verified Unlock confirmation has no Unlock button.");
-      unlockConfirm.click();
-      // Stop here. OIC can retain a stale row/action model immediately after unlocking;
-      // the background state machine reloads, verifies Configured/unlocked, then invokes
-      // this guarded flow again for the single activation submission.
-      return { ok: true, unlocked: true, submitted: false };
+      return { ok: true, submitted: false, status: "skipped-locked" };
     }
 
     // OPEN_ACTION / SUBMIT. OIC keeps row action links in the DOM but reveals them only
@@ -731,14 +858,27 @@ async function executeUiFlow(operation, target, prefs) {
     // prefer the action that belongs to the exact matched row even when it is still hidden.
     // The exact row was selected above, so its OIC action links are materialized.
     if (isActivation) {
-      var wasActive = /\bactive\b/i.test(normalize(row.innerText || row.textContent));
-      var activationAction = rowPrimaryAction(row) || (wasActive
-        ? findNamedIncludingHidden(["configure activation", "tracing"], row, true)
-        : findNamedIncludingHidden(["activate"], row, true));
-      if (!activationAction) {
+      var rowActivationText = normalize(row.innerText || row.textContent);
+      var wasActive = /\bactive\b/i.test(rowActivationText);
+      if (prefs.requireActive && !wasActive) {
+        return { ok: true, submitted: false, status: "skipped-not-active" };
+      }
+      var activationAction;
+      if (wasActive) {
+        // The visible primary action for an Active integration is Deactivate.
+        // Configure activation lives in the row's Actions menu; never use the
+        // primary icon for this branch or a bulk Debug action could deactivate it.
         var activationMenu = rowActionMenu(row) || findNamedIncludingHidden(["actions", "action menu", "more actions", "show actions", "more options"], row, true);
-        if (activationMenu) { openActionMenu(activationMenu); await sleep(300); }
-        activationAction = wasActive ? findNamed(["configure activation", "tracing"], document, true) : findNamed(["activate"], document);
+        if (!activationMenu) throw new Error("The exact integration row has no Actions menu.");
+        openActionMenu(activationMenu);
+        activationAction = await eventually(function () { return findNamed(["configure activation"], document, true); }, 5000, "OIC did not expose Configure activation in the exact row menu.");
+      } else {
+        activationAction = rowPrimaryAction(row) || findNamedIncludingHidden(["activate"], row, true);
+        if (!activationAction) {
+          var inactiveMenu = rowActionMenu(row) || findNamedIncludingHidden(["actions", "action menu", "more actions", "show actions", "more options"], row, true);
+          if (inactiveMenu) { openActionMenu(inactiveMenu); await sleep(300); }
+          activationAction = findNamed(["activate"], document);
+        }
       }
       if (!activationAction) throw new Error((wasActive ? "Configure activation" : "Activate") + " is unavailable for " + identity + ".");
       activationAction.click();
@@ -746,41 +886,144 @@ async function executeUiFlow(operation, target, prefs) {
       // These actions are explicitly named Activate Debug / Save, Activate Debug & Run.
       // Never let an older saved Production/Audit preference override that promise.
       var tracing = "debug";
-      var trace = Array.from(activationDialog.querySelectorAll("label")).filter(visible).find(function (item) {
+      var traceInput = controls(activationDialog).find(function (item) {
+        return item.tagName === "INPUT" && item.type === "radio" && normalize(item.value).toLowerCase() === tracing;
+      });
+      var trace = traceInput || Array.from(activationDialog.querySelectorAll("label")).filter(visible).find(function (item) {
         var label = normalize(item.textContent).toLowerCase();
         return label === tracing || label.indexOf(tracing + " ") === 0;
       }) || controls(activationDialog).find(function (item) { var label = labelOf(item).toLowerCase(); return label === tracing || label.indexOf(tracing + " ") === 0; });
       if (!trace) throw new Error("Could not select the saved " + tracing + " tracing level.");
-      trace.click();
+      var traceWasSelected = traceInput ? traceInput.checked === true : controls(activationDialog).some(function (item) {
+        var label = labelOf(item).toLowerCase();
+        var selected = item.checked === true || item.getAttribute("aria-checked") === "true" || item.getAttribute("data-oj-selected") === "true";
+        return selected && (label === tracing || label.indexOf(tracing + " ") === 0);
+      });
+      var traceChanged = !traceWasSelected;
+      if (traceChanged) trace.click();
       await eventually(function () {
+        if (traceInput) return traceInput.checked === true;
         return controls(activationDialog).some(function (item) {
           var label = labelOf(item).toLowerCase();
           var selected = item.checked === true || item.getAttribute("aria-checked") === "true" || item.getAttribute("data-oj-selected") === "true";
           return selected && (label === tracing || label.indexOf(tracing + " ") === 0);
         });
       }, 4000, "OIC kept Production selected, so activation was stopped before submission.");
-      function setDialogCheckbox(text, value) {
+      function findDialogCheckbox(text) {
         var semanticLabel = Array.from(activationDialog.querySelectorAll("label")).filter(visible).find(function (item) {
           return normalize(item.textContent).toLowerCase().indexOf(text) !== -1;
         });
-        var box = controls(activationDialog).find(function (item) { return labelOf(item).toLowerCase().indexOf(text) !== -1; });
-        if (!box) return;
-        var checked = box.checked === true || box.getAttribute("aria-checked") === "true";
-        if (checked !== value) (semanticLabel || box).click();
+        // Prefer the real input addressed by OIC's label. The broad controls()
+        // lookup can find a JET wrapper whose aria state does not represent the
+        // underlying native checkbox, causing an already checked option to be
+        // clicked (and therefore toggled off).
+        if (semanticLabel) {
+          var inputId = semanticLabel.getAttribute("for");
+          var labeledInput = inputId && document.getElementById(inputId);
+          if (labeledInput && activationDialog.contains(labeledInput) && labeledInput.tagName === "INPUT" && labeledInput.type === "checkbox") return labeledInput;
+          var nestedInput = semanticLabel.querySelector('input[type="checkbox"]');
+          if (nestedInput) return nestedInput;
+        }
+        throw new Error("Could not find OIC's native " + text + " checkbox.");
       }
-      setDialogCheckbox("allow to run again", !!prefs.allowRunAgain);
-      setDialogCheckbox("enable payload validation", !!prefs.payloadValidation);
-      await sleep(300);
+      function dialogCheckboxChecked(text) {
+        var box = findDialogCheckbox(text);
+        return box.checked === true;
+      }
+      async function setDialogCheckbox(text, value) {
+        var box = findDialogCheckbox(text);
+        var checked = box.checked === true;
+        var changed = checked !== value;
+        // OIC renders these as native inputs inside <oj-checkboxset>. Calling
+        // click() on the associated label does not reliably reach Oracle JET's
+        // value binding from an extension execution world. Click the exact
+        // native checkbox instead; HTMLElement.click() performs the checkbox's
+        // default toggle and emits its input/change lifecycle.
+        if (!changed) return { text: text, changed: false, value: value };
+        box.click();
+        // Updating one option can cause Oracle JET to replace both native
+        // inputs. Set and confirm each option before touching the next one;
+        // rapid back-to-back clicks were the source of one runtime option
+        // being silently dropped for some integrations.
+        await sleep(350);
+        if (dialogCheckboxChecked(text) !== value) {
+          // Do not assign .checked or perform a second blind click. Either can
+          // desynchronise OIC's JET model or toggle a correct option off.
+          throw new Error("OIC did not apply " + text + " after one checked-state change, so Save was stopped.");
+        }
+        await eventually(function () { return dialogCheckboxChecked(text) === value; }, 3500, "OIC did not apply " + text + ", so Save was stopped.");
+        await sleep(250);
+        return { text: text, changed: changed, value: value };
+      }
+      var runtimeOptions = [];
+      if (!prefs.preserveActivationOptions) {
+        // Enable-only behavior: neither setting is ever used to uncheck an OIC
+        // checkbox. A disabled preference simply preserves the integration's
+        // existing runtime option.
+        if (prefs.allowRunAgain) runtimeOptions.push(await setDialogCheckbox("allow to run again", true));
+        if (prefs.payloadValidation) runtimeOptions.push(await setDialogCheckbox("enable payload validation", true));
+        await eventually(function () {
+          return runtimeOptions.every(function (option) {
+            return dialogCheckboxChecked(option.text) === option.value;
+          });
+        }, 4000, "OIC did not apply the saved runtime options, so Save was stopped.");
+      }
+      var activationChanged = traceChanged || runtimeOptions.some(function (option) { return option.changed; });
+      if (wasActive && !activationChanged) {
+        var activationCancel = Array.from(activationDialog.querySelectorAll("button")).filter(visible).find(function (button) {
+          return labelOf(button).toLowerCase() === "cancel";
+        });
+        if (!activationCancel) throw new Error("The unchanged activation settings sheet has no Cancel button.");
+        activationCancel.click();
+        await eventually(function () { return !findActivationDialog(); }, 5000, "OIC did not close the unchanged activation settings sheet.");
+        return { ok: true, submitted: false, status: "skipped-already-configured" };
+      }
+      // Let Oracle JET commit the radio/checkbox model before Save reads it.
+      await sleep(800);
+      if (traceInput && traceInput.checked !== true) {
+        throw new Error("OIC changed Debug back to another tracing level, so Save was stopped.");
+      }
       var submitButton = Array.from(activationDialog.querySelectorAll("button")).filter(visible).find(function (button) {
         return labelOf(button).toLowerCase() === (wasActive ? "save" : "activate");
       });
       if (!submitButton) throw new Error("Could not submit activation settings.");
-      submitButton.click();
-      await eventually(function () {
+
+      function activationSubmissionAccepted() {
         if (!findActivationDialog()) return true;
         var pageText = normalize(document.body && document.body.innerText || "");
-        return /activation in progress|activating/i.test(pageText);
-      }, 8000, "OIC did not accept the Activate submission.");
+        // Configure activation is different from a fresh activation: OIC keeps
+        // the sheet open after Save and adds a confirmation above it. Treat that
+        // confirmation as acceptance; the later reload/row verification remains
+        // the source of truth for the persisted Debug state.
+        return /activation in progress|activating|were updated successfully|tracing is enabled(?: with payload)?/i.test(pageText);
+      }
+      function activationSubmissionStarted() {
+        var ojHost = submitButton.closest && submitButton.closest("oj-button");
+        return activationSubmissionAccepted()
+          || submitButton.disabled === true
+          || submitButton.getAttribute("aria-disabled") === "true"
+          || (ojHost && ojHost.getAttribute("disabled") !== null);
+      }
+
+      submitButton.click();
+      // Oracle JET's <oj-button> does not always translate HTMLElement.click()
+      // into its ojAction callback. Give the normal click a chance first, then
+      // invoke the component action once as a guarded fallback. This mirrors the
+      // trusted Save interaction without changing which exact dialog/button was
+      // selected by the safety checks above.
+      var quickDeadline = Date.now() + 1800;
+      while (Date.now() < quickDeadline && !activationSubmissionStarted()) await sleep(200);
+      if (!activationSubmissionStarted()) {
+        var ojButton = submitButton.closest && submitButton.closest("oj-button");
+        if (ojButton) {
+          ojButton.dispatchEvent(new CustomEvent("ojAction", {
+            bubbles: true,
+            cancelable: true,
+            detail: { originalEvent: new MouseEvent("click", { bubbles: true, cancelable: true, view: window }) }
+          }));
+        }
+      }
+      await eventually(activationSubmissionAccepted, 8000, "OIC did not accept the Activate/Save submission.");
     } else {
       var rowStatus = normalize(row.innerText || row.textContent).toLowerCase();
       if (operation === "edit" && /\bconfigured\b|\binactive\b|\bdraft\b/.test(rowStatus)) {

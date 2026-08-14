@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OIC Bulk Debug Fixture</title>
+  <link rel="stylesheet" href="../content/content.css">
+  <style>
+    body { margin: 0; color: #171717; background: #f7f7f7; font-family: Arial, sans-serif; }
+    header { display: flex; align-items: center; gap: 14px; padding: 24px 40px; color: #fff; background: #312d2a; }
+    header h1 { margin: 0 auto 0 0; font: 700 30px Georgia, serif; }
+    .filters { margin: 28px 40px 16px; padding: 14px 18px; color: #fff; background: #50545b; }
+    .filters ul { display: inline-flex; margin: 0; padding: 0; list-style: none; }
+    .filters li { display: flex; gap: 12px; align-items: center; padding: 10px 14px; border: 1px solid #8b919b; border-radius: 5px; }
+    .filters a { color: #fff; text-decoration: none; }
+    main { margin: 0 40px; padding: 18px; background: #fff; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 18px; border-bottom: 1px solid #ddd; text-align: left; }
+    td a { color: #171717; text-decoration: none; }
+  </style>
+  <script>
+    window.confirm = function (message) { window.fixtureConfirmation = message; return true; };
+    window.chrome = { runtime: {
+      onMessage: { addListener: function () {} },
+      sendMessage: function (message, callback) {
+        window.fixtureMessages = window.fixtureMessages || [];
+        window.fixtureMessages.push(message);
+        window.fixtureMessage = message;
+        if (new URLSearchParams(location.search).has("failure") && /APInvoice_ERP_Arjeet/.test(message.target && message.target.name || "")) {
+          callback({ ok: false, error: { message: "OIC did not keep Debug selected.", helperTabId: 123 } });
+        } else {
+          var status = /DEBUG TRACING/i.test(message.target && message.target.status || "") ? "skipped-already-configured" : "active-debug";
+          callback({ ok: true, result: { status: status, target: message.target } });
+        }
+      }
+    } };
+  </script>
+</head>
+<body>
+  <header><h1>Integrations</h1><button>Import</button><button>Create</button></header>
+  <section class="filters"><ul><li>Updated by <strong>ARJEET.ANAND@ORACLE.COM</strong><a href="#" aria-label="Remove Filter Updated by">×</a></li></ul></section>
+  <main>
+    <h2>4 integrations</h2>
+    <table role="application">
+      <thead><tr><th>Name</th><th>Version</th><th>Style</th><th>Last updated</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr id="APINV_ATP_CREAT_UPDAT_ARJEE_ERP|01.00.0000"><td><a href="#">APINV_ATP_Create_Update_arjeet_erp</a></td><td>1.0.0</td><td>Application</td><td>Aug 14, 2026</td><td>Active</td></tr>
+        <tr id="ARJEET_ERP_TEST|01.00.0000"><td><a href="#">arjeet_erp_test</a></td><td>1.0.0</td><td>Application</td><td>Aug 12, 2026</td><td>Configured</td></tr>
+        <tr id="APIN_ATP_CREA_UPDA_APIN_ERP_ARJE|01.00.0000"><td><a href="#">APINV_ATP_Create_Update_APInvoice_ERP_Arjeet</a></td><td>1.0.0</td><td>Application</td><td>Aug 14, 2026</td><td>Active DEBUG TRACING</td></tr>
+        <tr id="RDP_POC_OIC_FUNCTI_PRACTI|01.00.0000"><td><a href="#">RDP_POC_OIC_FUNCTIONS_PRACTICE</a></td><td>1.0.0</td><td>Application</td><td>Aug 14, 2026</td><td>Active DEBUG TRACING</td></tr>
+      </tbody>
+    </table>
+  </main>
+  <script src="../shared/targets.js"></script>
+  <script src="../content/content.js"></script>
+</body>
+</html>

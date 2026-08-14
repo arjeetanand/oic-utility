@@ -10,6 +10,7 @@ The extension runs entirely in your browser, uses your existing signed-in OIC se
 
 | OIC page | Extension control | Result |
 | --- | --- | --- |
+| **Integrations** | **Apply Debug Settings to N Active** | Reconfigures every currently Active integration in scope, including integrations already in Debug, and applies the saved rerun and payload-validation settings. Active filters limit the scope; with no filters, all results are used. |
 | **Instances** | **Edit** | Opens the exact integration and version in a Design tab. If Active, it safely deactivates it first. |
 | **Integration editor** | **Save, Activate Debug & Run** | Saves pending edits, releases OIC's edit lock, activates the same integration with the selected tracing settings, then opens its Run page. |
 | **Run** | **Edit** | Opens the current integration/version for editing, using the same guarded deactivate flow. |
@@ -44,13 +45,23 @@ The repository also includes `oic-debug-controls.zip`. Extract it first, then us
 
 Only HTTPS `*.oraclecloud.com` Design origins are accepted. The default Hyderabad Design origin is already configured. New environments take effect in currently open OIC tabs as well as future ones.
 
-You can also configure:
+Debug tracing is always used. You can configure the runtime options applied during bulk activation:
 
-- **Tracing level**: Debug, Audit, or Production
 - **Allow to run again**
 - **Enable payload validation**
 
 ## Typical workflow
+
+### Bulk Debug activation
+
+1. Open OIC **Integrations**.
+2. Apply filters when you want to limit the scope. With no filters, the action covers the full result set.
+3. Select **Apply Debug Settings to _N_ Active** and review the exact confirmation list.
+4. The extension processes integrations sequentially, re-checks that each one is still Active, selects Debug, applies the saved runtime options, and saves. Locked, inactive, or concurrently busy integrations are skipped.
+
+The bulk action applies the saved **Allow to run again** and **Enable payload validation** values, including to integrations already showing DEBUG TRACING.
+
+### Edit, activate, and run
 
 1. Open OIC **Instances** and locate an integration in the **Primary identifier** column.
 2. Select **Edit** beside it and confirm the prompt.
