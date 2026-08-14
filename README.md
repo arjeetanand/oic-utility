@@ -11,6 +11,7 @@ The extension runs entirely in your browser, uses your existing signed-in OIC se
 | OIC page | Extension control | Result |
 | --- | --- | --- |
 | **Integrations** | **Apply Debug Settings to N Active** | Reconfigures every currently Active integration in scope, including integrations already in Debug, and applies the saved rerun and payload-validation settings. Active filters limit the scope; with no filters, all results are used. |
+| **Project detail** | **Apply Debug Settings to N Active** | Reconfigures every currently Active integration in that project with Debug tracing and the saved rerun and payload-validation settings. Use it after OIC finishes activating the project. |
 | **Instances** | **Edit** | Opens the exact integration and version in a Design tab. If Active, it safely deactivates it first. |
 | **Integration editor** | **Save, Activate Debug & Run** | Saves pending edits, releases OIC's edit lock, activates the same integration with the selected tracing settings, then opens its Run page. |
 | **Run** | **Edit** | Opens the current integration/version for editing, using the same guarded deactivate flow. |
@@ -54,12 +55,15 @@ Debug tracing is always used. You can configure the runtime options applied duri
 
 ### Bulk Debug activation
 
-1. Open OIC **Integrations**.
-2. Apply filters when you want to limit the scope. With no filters, the action covers the full result set.
+1. Open OIC **Integrations**, or open a project and activate its deployment first.
+2. On **Integrations**, apply filters when you want to limit the scope. On **Project detail**, the scope is the currently Active integrations in that project.
 3. Select **Apply Debug Settings to _N_ Active** and review the exact confirmation list.
 4. The extension processes integrations sequentially, re-checks that each one is still Active, selects Debug, applies the saved runtime options, and saves. Locked, inactive, or concurrently busy integrations are skipped.
 
 The bulk action applies the saved **Allow to run again** and **Enable payload validation** values, including to integrations already showing DEBUG TRACING.
+Adapter-specific options are applied only when OIC exposes them; for example, schedule integrations receive Debug but do not expose REST-only rerun or payload-validation checkboxes.
+
+OIC project activation offers Production or Audit tracing, not Debug. The Project detail control therefore updates each active integration individually after project activation; it does not alter the project deployment or activate inactive project integrations.
 
 ### Edit, activate, and run
 

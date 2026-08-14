@@ -22,6 +22,8 @@
   // authoritative signal for this view.
   function isInstances() { return OicTargets.isInstancesUrl(currentUrl()); }
   function isIntegrations() { return /[?&]root=integrations(?:&|$)/i.test(currentUrl()); }
+  function isProjectDetail() { return OicTargets.isProjectDetailUrl(currentUrl()); }
+  function isBulkDebugPage() { return OicTargets.isBulkDebugUrl(currentUrl()); }
   function isEditor() { return /root=integration(?:&|$)/i.test(currentUrl()) && !/root=integrations(?:&|$)/i.test(currentUrl()); }
   function isRun() { return OicTargets.isRunUrl(currentUrl()); }
   function elementText(element) { return OicTargets.clean([element.getAttribute && element.getAttribute("aria-label"), element.getAttribute && element.getAttribute("title"), element.textContent].filter(Boolean).join(" ")); }
@@ -68,10 +70,13 @@
     // runtime-settings result and must not be shown as a misleading success toast.
     if (!verified.length) return null;
     var debug = verified.filter(function (item) { return item.verification.debug; });
-    var payload = verified.filter(function (item) { return item.verification.payloadValidation; });
-    var payloadOff = verified.filter(function (item) { return !item.verification.payloadValidation; }).map(function (item) { return item.target.name; });
-    var message = "Cross-check: Debug " + debug.length + "/" + verified.length + "; payload validation enabled " + payload.length + "/" + verified.length + ".";
+    var payloadApplicable = verified.filter(function (item) { return item.verification.payloadValidationAvailable !== false; });
+    var payload = payloadApplicable.filter(function (item) { return item.verification.payloadValidation; });
+    var payloadOff = payloadApplicable.filter(function (item) { return !item.verification.payloadValidation; }).map(function (item) { return item.target.name; });
+    var payloadUnavailable = verified.filter(function (item) { return item.verification.payloadValidationAvailable === false; }).map(function (item) { return item.target.name; });
+    var message = "Cross-check: Debug " + debug.length + "/" + verified.length + "; payload validation enabled " + payload.length + "/" + payloadApplicable.length + " applicable.";
     if (payloadOff.length) message += " Payload off: " + payloadOff.join(", ") + ".";
+    if (payloadUnavailable.length) message += " Payload validation unavailable: " + payloadUnavailable.join(", ") + ".";
     return message;
   }
   function rememberBulkCrossCheck(results) {
@@ -90,15 +95,25 @@
     if (!response || !response.ok || !response.runtimeOptions) throw new Error("Could not read the saved runtime settings. Open extension Settings, save them, then retry.");
     return { allowRunAgain: !!response.runtimeOptions.allowRunAgain, payloadValidation: !!response.runtimeOptions.payloadValidation };
   }
-  function refreshIntegrationsAfterBulk() {
-    // The source tab is the user's main Integrations page. Once every bounded
-    // helper operation has completed, reload that page so its list/statuses are
-    // current and it remains the visible page rather than a helper tab.
+  function refreshBulkPage() {
+    // The source tab is the user's main Integrations or Project detail page. Once
+    // every bounded operation has completed, refresh its statuses. Project router
+    // URLs do not survive a browser reload, so use OIC's native Refresh action.
     setTimeout(function () {
-      if (isIntegrations() && !activationSheetVisible()) window.location.reload();
+      if (!isBulkDebugPage() || activationSheetVisible()) return;
+      if (isProjectDetail()) {
+        var refresh = Array.from(document.querySelectorAll("button,a,[role=button],oj-button")).find(function (element) {
+          return visible(element) && !element.closest("#" + ROOT_ID) && elementText(element).toLowerCase() === "refresh";
+        });
+        if (refresh) refresh.click();
+        else showError({ message: "OIC's Project Refresh control was not found. Use Refresh to update the integration statuses." });
+        return;
+      }
+      window.location.reload();
     }, 700);
   }
   function activeFilters() {
+    if (!isIntegrations()) return [];
     return Array.from(document.querySelectorAll("a,button,[role=button]")).filter(function (element) {
       return visible(element) && !element.closest("#" + ROOT_ID) && /^remove filter\b/i.test(elementText(element));
     }).map(function (element) {
@@ -106,16 +121,30 @@
       return OicTargets.clean(chip && chip.innerText || elementText(element).replace(/^remove filter\s*/i, "")).replace(/\s*[×✕]\s*$/, "");
     }).filter(Boolean);
   }
+  function integrationTargetFromRow(row) {
+    if (!visible(row)) return null;
+    var cells = Array.from(row.querySelectorAll(":scope > td, :scope > [role=cell]"));
+    var nameLink = Array.from(row.querySelectorAll("a")).find(function (link) {
+      var label = elementText(link);
+      return visible(link) && label && !/^(?:activate|deactivate|configure activation|actions?|more actions|open details|run|edit)$/i.test(label);
+    });
+    if (!nameLink) return null;
+    var name = OicTargets.clean(nameLink.getAttribute("aria-label") || nameLink.getAttribute("title") || nameLink.textContent);
+    var rowText = OicTargets.clean(row.innerText || row.textContent);
+    var version = cells.length > 1 ? OicTargets.clean(cells[1].innerText || cells[1].textContent) : "";
+    var versionMatch = version.match(/^\d+(?:\.\d+){1,3}$/) || rowText.match(/(?:^|\s)(\d+(?:\.\d+){1,3})(?=\s|$)/);
+    version = versionMatch && (versionMatch[1] || versionMatch[0]);
+    var status = cells.length ? OicTargets.clean(cells[cells.length - 1].innerText || cells[cells.length - 1].textContent) : "";
+    var statusMatch = rowText.match(/\b(?:Active(?:\s+(?:DEBUG|AUDIT|PRODUCTION)\s+TRACING)?|Configured|Draft|Locked|Failed)\b/i);
+    if (!/^(?:Active|Configured|Draft|Locked|Failed)\b/i.test(status)) status = statusMatch && statusMatch[0] || "";
+    if (!name || !version || !status) return null;
+    var target = OicTargets.makeListTarget(row.id, name, version, status);
+    if (target) return target;
+    return { name: name, code: "", version: version, key: name + "|" + version, status: status };
+  }
   function scanIntegrationRows(targets) {
-    Array.from(document.querySelectorAll('tr[id*="|"]')).forEach(function (row) {
-      if (!visible(row)) return;
-      var cells = Array.from(row.querySelectorAll(":scope > td, :scope > [role=cell]"));
-      if (cells.length < 2) return;
-      var nameLink = cells[0].querySelector("a");
-      var name = OicTargets.clean(nameLink && (nameLink.getAttribute("aria-label") || nameLink.getAttribute("title") || nameLink.textContent) || cells[0].innerText);
-      var version = OicTargets.clean(cells[1].innerText || cells[1].textContent);
-      var status = OicTargets.clean(cells[cells.length - 1].innerText || cells[cells.length - 1].textContent);
-      var target = OicTargets.makeListTarget(row.id, name, version, status);
+    Array.from(document.querySelectorAll('tr,[role="row"],oj-list-item,li')).forEach(function (row) {
+      var target = integrationTargetFromRow(row);
       if (target) targets.set(target.key, target);
     });
   }
@@ -138,6 +167,16 @@
     });
   }
   function bulkAnchor() {
+    if (isProjectDetail()) {
+      var projectAction = Array.from(document.querySelectorAll("button,a,[role=button],oj-button")).find(function (element) {
+        if (!visible(element) || element.closest("#" + ROOT_ID)) return false;
+        var rowHost = element.closest("tr,[role=row],oj-list-item,li");
+        if (rowHost && integrationTargetFromRow(rowHost)) return false;
+        return /^(?:add|activate|deactivate)(?: project)?$/i.test(elementText(element));
+      });
+      if (!projectAction) return null;
+      return projectAction.closest("oj-button") || projectAction.closest("button,a,[role=button]") || projectAction;
+    }
     var create = Array.from(document.querySelectorAll("button,a,[role=button],oj-button")).find(function (element) {
       return visible(element) && !element.closest("#" + ROOT_ID) && elementText(element).toLowerCase() === "create";
     });
@@ -150,7 +189,8 @@
   async function collectBulkScope() {
     var scope = bulkScopeFromLoadedRows();
     var targets = new Map(scope.targets.map(function (target) { return [target.key, target]; }));
-    var table = document.querySelector('table[role="application"], table');
+    var firstRow = Array.from(document.querySelectorAll('tr,[role="row"],oj-list-item,li')).find(function (row) { return !!integrationTargetFromRow(row); });
+    var table = document.querySelector('table[role="application"], table') || firstRow;
     var scrollers = [];
     var ancestor = table;
     while (ancestor) {
@@ -183,13 +223,13 @@
   async function requestBulkOperation() {
     try {
       var scope = await collectBulkScope();
-      if (!scope.targets.length) { showError({ message: "No currently Active integrations are in this " + (scope.filters.length ? "filtered result set." : "list.") }); return; }
+      if (!scope.targets.length) { showError({ message: "No currently Active integrations are in " + (isProjectDetail() ? "this project." : scope.filters.length ? "this filtered result set." : "this list.") }); return; }
       var runtimeOptions = await runtimeOptionsSnapshot();
-      var scopeText = scope.filters.length ? "the current filtered results (" + scope.filters.join(", ") + ")" : "all integrations";
+      var scopeText = isProjectDetail() ? "this project" : scope.filters.length ? "the current filtered results (" + scope.filters.join(", ") + ")" : "all integrations";
       var names = scope.targets.slice(0, 8).map(function (target) { return "• " + target.name + " (" + target.version + ")"; }).join("\n");
       if (scope.targets.length > 8) names += "\n• …and " + (scope.targets.length - 8) + " more";
-      var runtimeText = "Allow to run again: " + (runtimeOptions.allowRunAgain ? "ENABLE if currently off" : "leave unchanged") + "\nEnable payload validation: " + (runtimeOptions.payloadValidation ? "ENABLE if currently off" : "leave unchanged");
-      if (!window.confirm("Apply Debug and saved runtime settings to " + scope.targets.length + " currently Active integration" + (scope.targets.length === 1 ? "" : "s") + " from " + scopeText + "?\n\n" + names + "\n\nOIC will receive exactly (enable-only; it never unchecks these options):\n" + runtimeText + "\n\nLocked or no-longer-Active integrations are skipped.")) return;
+      var runtimeText = "Allow to run again: " + (runtimeOptions.allowRunAgain ? "ENABLE if currently off, when available" : "leave unchanged") + "\nEnable payload validation: " + (runtimeOptions.payloadValidation ? "ENABLE if currently off, when available" : "leave unchanged");
+      if (!window.confirm("Apply Debug and saved runtime settings to " + scope.targets.length + " currently Active integration" + (scope.targets.length === 1 ? "" : "s") + " from " + scopeText + "?\n\n" + names + "\n\nOIC will receive exactly (enable-only; it never unchecks these options):\n" + runtimeText + "\n\nOptions not exposed for an integration type are skipped. Locked or no-longer-Active integrations are skipped.")) return;
       var summary = { total: scope.targets.length, succeeded: 0, skipped: 0, failed: 0, results: [] };
       bulkState = { phase: "Preparing " + scope.targets.length + " integrations…", complete: false, error: null, current: 0, total: scope.targets.length };
       render();
@@ -222,12 +262,12 @@
         var first = failed[0];
         var suffix = failed.length > 1 ? " (and " + (failed.length - 1) + " more failure" + (failed.length === 2 ? "" : "s") + ")" : "";
         showError({ message: "Debug failed for " + first.target.name + ": " + (first.error || "OIC did not accept the change.") + suffix, helperTabId: first.helperTabId });
-        refreshIntegrationsAfterBulk();
+        refreshBulkPage();
         return;
       }
       rememberBulkCrossCheck(summary.results);
       showSuccess("Debug activation complete: " + (summary.succeeded || 0) + " updated, " + (summary.skipped || 0) + " skipped, " + (summary.failed || 0) + " failed.");
-      refreshIntegrationsAfterBulk();
+      refreshBulkPage();
     } catch (error) {
       bulkState = { phase: "Stopped: " + (error.message || String(error)), complete: true, error: error.message || String(error) };
       render();
@@ -238,8 +278,8 @@
   function renderBulkControl() {
     var id = "oic-bulk-debug-control";
     var previous = document.getElementById(id);
-    // This belongs alongside OIC's Import/Create controls, never as a floating
-    // overlay. Hide it whenever OIC has an open sheet, dialog, or menu.
+    // This belongs alongside OIC's native page action, never as a floating overlay.
+    // Hide it whenever OIC has an open sheet, dialog, or menu.
     if (activationSheetVisible() || oicOverlayVisible()) { if (previous) previous.remove(); return; }
     var anchor = bulkAnchor();
     if (!anchor) { if (previous) previous.remove(); return; }
@@ -255,11 +295,11 @@
     } else {
       var label = activeTargets.length ? "Apply Debug Settings to " + activeTargets.length + " Active" : "No Active Integrations";
       var action = button(label, "oic-activate-all", requestBulkOperation, activeTargets.length === 0);
-      action.title = loaded.filters.length ? "Applies Debug and saved runtime settings only to Active integrations in the current filters: " + loaded.filters.join(", ") : "Applies Debug and saved runtime settings to all currently Active integrations";
+      action.title = isProjectDetail() ? "Applies Debug and saved runtime settings to all currently Active integrations in this project" : loaded.filters.length ? "Applies Debug and saved runtime settings only to Active integrations in the current filters: " + loaded.filters.join(", ") : "Applies Debug and saved runtime settings to all currently Active integrations";
       wrap.appendChild(action);
     }
-    // Keep every native OIC header action in place. This merely adds a sibling
-    // after Create; it does not wrap, replace, hide, or restyle Create.
+    // Keep every native OIC header action in place. This merely adds a sibling;
+    // it does not wrap, replace, hide, or restyle the native action.
     anchor.insertAdjacentElement("afterend", wrap);
   }
   function findFilterTarget() { return OicTargets.findFilteredTarget(document.body && document.body.innerText || ""); }
@@ -343,7 +383,7 @@
   }
   function render() {
     if (!document.body) return;
-    if (isIntegrations()) {
+    if (isBulkDebugPage()) {
       ensureRoot();
       renderBulkControl();
       document.querySelectorAll(".oic-row-control, .oic-page-control").forEach(function (control) { control.remove(); });
@@ -374,5 +414,5 @@
   });
   observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
   window.addEventListener("popstate", scheduleRender); window.addEventListener("hashchange", scheduleRender); setInterval(scheduleRender, 1500); render();
-  if (isIntegrations()) showRememberedBulkCrossCheck();
+  if (isBulkDebugPage()) showRememberedBulkCrossCheck();
 })();

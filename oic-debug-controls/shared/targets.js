@@ -77,6 +77,14 @@
     return /(?:root=monitoringTracking|monitoringTracking|\/instances)/i.test(String(url || ""));
   }
 
+  function isProjectDetailUrl(url) {
+    return /[?&]root=projectDetail(?:&|$)/i.test(String(url || ""));
+  }
+
+  function isBulkDebugUrl(url) {
+    return /[?&]root=integrations(?:&|$)/i.test(String(url || "")) || isProjectDetailUrl(url);
+  }
+
   // OIC has used both routes for the Configure and run page. `submitIntegration`
   // is the current route in newer Design tenants, while `invokeIntegration`
   // remains in older tenants.
@@ -96,6 +104,8 @@
     findPageTarget: findPageTarget,
     targetFromElement: targetFromElement,
     isInstancesUrl: isInstancesUrl,
+    isProjectDetailUrl: isProjectDetailUrl,
+    isBulkDebugUrl: isBulkDebugUrl,
     isRunUrl: isRunUrl
   };
 })(typeof self !== "undefined" ? self : this);

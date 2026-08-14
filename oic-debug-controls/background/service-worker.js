@@ -94,9 +94,9 @@ function serializeError(error) {
 // batches to be terminated mid-run with no final result. The content script now
 // sequences these bounded target operations and owns the aggregate summary.
 async function startBulkTarget(target, sourceTabId, requestedRuntimeOptions) {
-  if (!Number.isInteger(sourceTabId)) throw new Error("This action must be started from an OIC Integrations tab.");
+  if (!Number.isInteger(sourceTabId)) throw new Error("This action must be started from an OIC Integrations or Project detail page.");
   var source = await chrome.tabs.get(sourceTabId);
-  if (!source || !/[?&]root=integrations(?:&|$)/i.test(source.url || "")) throw new Error("Activate Active in Debug must be started from the OIC Integrations list.");
+  if (!source || !OicTargets.isBulkDebugUrl(source.url || "")) throw new Error("Apply Debug Settings must be started from the OIC Integrations list or a Project detail page.");
   validateRequest("activate-debug", target, sourceTabId);
   if (activeOperations.has(target.key)) return { status: "skipped-busy", target: target };
 
@@ -206,12 +206,17 @@ async function runUiProvider(operation, target, prefs, state) {
   var source = await chrome.tabs.get(state.sourceTabId);
   var instance = new URL(source.url).searchParams.get("integrationInstance");
   if (!instance) throw new Error("Could not determine the OIC service instance from this page.");
-  // Start on the Integrations list directly. Cloning the Instances URL and clicking the
-  // Design navigation is unreliable when OIC's left navigation is collapsed.
+  // Project integrations do not appear on the standalone Integrations list. Preserve
+  // the exact Project detail route (including its OIC router state) for bulk Debug.
+  // Other operations start on the Integrations list directly because navigating
+  // through OIC's collapsed left navigation is unreliable.
+  var projectSource = operation === "activate-debug" && OicTargets.isProjectDetailUrl(source.url || "");
   var hostTabs = await new Promise(function (resolve) { chrome.tabs.query({ url: originPattern(source.url) }, resolve); });
-  var existingList = hostTabs.find(function (tab) { return /[?&]root=integrations(?:&|$)/i.test(tab.url || ""); });
+  var existingList = !projectSource && hostTabs.find(function (tab) { return /[?&]root=integrations(?:&|$)/i.test(tab.url || ""); });
   var helperUrl;
-  if (existingList) {
+  if (projectSource) {
+    helperUrl = new URL(source.url);
+  } else if (existingList) {
     helperUrl = new URL(existingList.url);
     helperUrl.searchParams.set("integrationInstance", instance);
   } else {
@@ -221,22 +226,27 @@ async function runUiProvider(operation, target, prefs, state) {
     helperUrl.searchParams.set("integrationInstance", instance);
     helperUrl.hash = "";
   }
-  // Reuse the source tab after it leaves the editor. The editor owns OIC's lock, so
+  // Reuse Project detail itself because its OIC router state cannot be reopened or
+  // browser-reloaded reliably. Every project operation stays on this page and uses
+  // OIC's native Refresh action. Also reuse the source after it leaves the editor;
+  // the editor owns OIC's lock, so
   // activating through a second tab would still see the exact integration as Locked.
   // Every Edit request starts from a separate Design tab. Keeping an opener link makes
   // the relationship clear in the browser while preserving the original OIC page.
-  var helper = operation === "activate-debug-run" && /[?&]root=integrations(?:&|$)/i.test(source.url || "")
+  var helper = projectSource
+    ? source
+    : operation === "activate-debug-run" && /[?&]root=integrations(?:&|$)/i.test(source.url || "")
     ? source
     // Edit is a user-requested navigation: foreground the new Design tab right away
     // so the user does not have to locate and select it while OIC is loading.
     : await chrome.tabs.create({ url: helperUrl.toString(), active: operation === "edit", openerTabId: source.id });
   state.helperTabId = helper.id;
-  // Bulk Debug always uses a disposable helper tab. Close it in finally, even
-  // when OIC rejects a change, so only the original Integrations tab remains.
+  // Standalone Integrations bulk Debug uses a disposable helper tab. Project
+  // detail operates in its source tab and therefore is never closed here.
   var closeHelperWhenFinished = operation === "activate-debug" && helper.id !== source.id;
   try {
     if (helper.id !== source.id) await waitForTab(helper.id, 30000);
-    state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? "Opening Integrations and activating debug…" : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
+    state.phase = operation === "activate-debug" || operation === "activate-debug-run" ? (projectSource ? "Opening Project details and applying Debug…" : "Opening Integrations and activating debug…") : operation === "edit" ? "Checking integration status…" : "Opening Integrations and deactivating…";
     publishState(target.key);
     var submitted = await execute(helper.id, executeUiFlow, [operation, target, prefs]);
     if (!submitted || !submitted.ok) throw withHelper(new Error((submitted && submitted.error) || "OIC did not accept the operation."), helper.id);
@@ -315,12 +325,34 @@ async function verifyWithReloads(tabId, operation, target, timeoutMs) {
   var deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await new Promise(function (resolve) { setTimeout(resolve, 2500); });
-    await new Promise(function (resolve) { chrome.tabs.reload(tabId, {}, resolve); });
-    await waitForTab(tabId, 30000);
+    var tab = await chrome.tabs.get(tabId);
+    if (OicTargets.isProjectDetailUrl(tab.url || "")) {
+      var refreshed = await execute(tabId, refreshProjectIntegrations, []);
+      if (!refreshed || !refreshed.ok) return refreshed || { ok: false, error: "OIC's Project Refresh control was unavailable." };
+      await new Promise(function (resolve) { setTimeout(resolve, 1200); });
+    } else {
+      await new Promise(function (resolve) { chrome.tabs.reload(tabId, {}, resolve); });
+      await waitForTab(tabId, 30000);
+    }
     var result = await execute(tabId, inspectTargetStatus, [operation, target]);
     if (result && (result.ok || result.terminalError)) return result;
   }
-  return { ok: false, error: "Timed out waiting for OIC to update " + target.code + "|" + target.version + "." };
+  return { ok: false, error: "Timed out waiting for OIC to update " + (target.code || target.name) + "|" + target.version + "." };
+}
+
+function refreshProjectIntegrations() {
+  function clean(value) { return String(value || "").replace(/\s+/g, " ").trim().toLowerCase(); }
+  function visible(element) { return !!(element && (element.offsetWidth || element.offsetHeight || element.getClientRects().length)); }
+  try {
+    if (!/root=projectDetail(?:&|$)/i.test(location.href)) return { ok: false, error: "OIC is not on a Project detail page." };
+    var refresh = Array.from(document.querySelectorAll('button,a,[role="button"],oj-button')).find(function (element) {
+      var label = clean([element.getAttribute("aria-label"), element.getAttribute("title"), element.textContent].filter(Boolean).join(" "));
+      return visible(element) && label === "refresh";
+    });
+    if (!refresh) return { ok: false, error: "OIC's Project Refresh control was not found." };
+    refresh.click();
+    return { ok: true };
+  } catch (error) { return { ok: false, error: error.message || String(error) }; }
 }
 
 async function saveEditorIfNeeded(tabId, target) {
@@ -551,12 +583,11 @@ async function inspectActivationRuntimeOptions(target, prefs) {
     var label = Array.from(sheet.querySelectorAll("label")).find(function (item) { return visible(item) && clean(item.textContent).toLowerCase().indexOf(text) !== -1; });
     var inputId = label && label.getAttribute("for");
     var input = inputId && document.getElementById(inputId);
-    if (input && sheet.contains(input)) return input;
-    throw new Error("OIC did not expose the " + text + " checkbox for verification.");
+    return input && sheet.contains(input) ? input : null;
   }
-  function checked(input) { return input.checked === true || input.getAttribute("aria-checked") === "true"; }
+  function checked(input) { return !!(input && (input.checked === true || input.getAttribute("aria-checked") === "true")); }
   try {
-    if (!/root=integrations(?:&|$)/i.test(location.href)) throw new Error("OIC is not on the Integrations list while verifying runtime options.");
+    if (!/root=(?:integrations|projectDetail)(?:&|$)/i.test(location.href)) throw new Error("OIC is not on the Integrations list or Project detail page while verifying runtime options.");
     var row = findRow();
     if (!row) throw new Error("Could not find the exact active integration while verifying runtime options.");
     row.scrollIntoView({ block: "center" });
@@ -585,12 +616,18 @@ async function inspectActivationRuntimeOptions(target, prefs) {
     });
     var allowRunAgain = findCheckbox(sheet, "allow to run again");
     var payloadValidation = findCheckbox(sheet, "enable payload validation");
-    var options = { debug: !!(debugRadio && checked(debugRadio)), allowRunAgain: checked(allowRunAgain), payloadValidation: checked(payloadValidation) };
+    var options = {
+      debug: !!(debugRadio && checked(debugRadio)),
+      allowRunAgain: checked(allowRunAgain),
+      allowRunAgainAvailable: !!allowRunAgain,
+      payloadValidation: checked(payloadValidation),
+      payloadValidationAvailable: !!payloadValidation
+    };
     // Runtime settings are enable-only. An unchecked extension preference means
     // "leave the current OIC value unchanged", never "turn it off".
     var matches = options.debug
-      && (!prefs.allowRunAgain || options.allowRunAgain)
-      && (!prefs.payloadValidation || options.payloadValidation);
+      && (!prefs.allowRunAgain || !options.allowRunAgainAvailable || options.allowRunAgain)
+      && (!prefs.payloadValidation || !options.payloadValidationAvailable || options.payloadValidation);
     var cancel = Array.from(sheet.querySelectorAll("button")).find(function (button) { return visible(button) && /^cancel$/i.test(labelOf(button)); });
     if (cancel) cancel.click();
     if (!matches) {
@@ -808,12 +845,14 @@ async function executeUiFlow(operation, target, prefs) {
     return Array.from(document.querySelectorAll('tr,[role="row"],oj-list-item,li')).find(isTargetScope);
   }
   try {
-    // OPEN_INTEGRATIONS
+    // OPEN_INTEGRATIONS. A Project detail helper is already on the only page that
+    // contains its project-scoped integrations, so do not navigate it to Design.
     await eventually(function () { return document.body && document.body.innerText; }, 15000, "OIC did not become ready. Sign in to OIC in the helper tab.");
-    if (!clickNamed(["integrations"])) {
+    var onProjectDetail = /root=projectDetail(?:&|$)/i.test(location.href);
+    if (!onProjectDetail && !clickNamed(["integrations"])) {
       if (clickNamed(["design"])) { await sleep(700); clickNamed(["integrations"]); }
     }
-    await eventually(function () { return /root=integration/i.test(location.href) || /\b\d+\s+integrations\b/i.test(document.body.innerText); }, 15000, "Design navigation does not expose the Integrations page.");
+    await eventually(function () { return /root=(?:integrations|projectDetail)(?:&|$)/i.test(location.href) || /\b\d+\s+integrations\b/i.test(document.body.innerText); }, 15000, "OIC does not expose the requested Integrations surface.");
 
     // LOCATE_TARGET: use an already-visible exact row before touching OIC's filters. The
     // filter component can remain behind a blocking spinner when several filter changes are
@@ -924,14 +963,17 @@ async function executeUiFlow(operation, target, prefs) {
           var nestedInput = semanticLabel.querySelector('input[type="checkbox"]');
           if (nestedInput) return nestedInput;
         }
-        throw new Error("Could not find OIC's native " + text + " checkbox.");
+        // Runtime options are adapter-specific. Schedule integrations, for
+        // example, expose neither Allow to run again nor payload validation.
+        return null;
       }
       function dialogCheckboxChecked(text) {
         var box = findDialogCheckbox(text);
-        return box.checked === true;
+        return box ? box.checked === true : null;
       }
       async function setDialogCheckbox(text, value) {
         var box = findDialogCheckbox(text);
+        if (!box) return { text: text, changed: false, value: value, available: false };
         var checked = box.checked === true;
         var changed = checked !== value;
         // OIC renders these as native inputs inside <oj-checkboxset>. Calling
@@ -939,7 +981,7 @@ async function executeUiFlow(operation, target, prefs) {
         // value binding from an extension execution world. Click the exact
         // native checkbox instead; HTMLElement.click() performs the checkbox's
         // default toggle and emits its input/change lifecycle.
-        if (!changed) return { text: text, changed: false, value: value };
+        if (!changed) return { text: text, changed: false, value: value, available: true };
         box.click();
         // Updating one option can cause Oracle JET to replace both native
         // inputs. Set and confirm each option before touching the next one;
@@ -953,7 +995,7 @@ async function executeUiFlow(operation, target, prefs) {
         }
         await eventually(function () { return dialogCheckboxChecked(text) === value; }, 3500, "OIC did not apply " + text + ", so Save was stopped.");
         await sleep(250);
-        return { text: text, changed: changed, value: value };
+        return { text: text, changed: changed, value: value, available: true };
       }
       var runtimeOptions = [];
       if (!prefs.preserveActivationOptions) {
@@ -964,7 +1006,7 @@ async function executeUiFlow(operation, target, prefs) {
         if (prefs.payloadValidation) runtimeOptions.push(await setDialogCheckbox("enable payload validation", true));
         await eventually(function () {
           return runtimeOptions.every(function (option) {
-            return dialogCheckboxChecked(option.text) === option.value;
+            return !option.available || dialogCheckboxChecked(option.text) === option.value;
           });
         }, 4000, "OIC did not apply the saved runtime options, so Save was stopped.");
       }
